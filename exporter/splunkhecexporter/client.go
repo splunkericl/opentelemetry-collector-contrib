@@ -35,6 +35,7 @@ type iterState struct {
 	resource int // index in ResourceLogs/ResourceMetrics/ResourceSpans list
 	library  int // index in ScopeLogs/ScopeMetrics/ScopeSpans list
 	record   int // index in Logs/Metrics/Spans list
+	event    int // index for slices of splunk.Event. This is used for the new exporter batching method
 	done     bool
 }
 
@@ -82,6 +83,83 @@ func newTracesClient(set exporter.CreateSettings, cfg *Config) *client {
 
 func newMetricsClient(set exporter.CreateSettings, cfg *Config) *client {
 	return newClient(set, cfg, cfg.MaxContentLengthMetrics)
+}
+
+func (c *client) pushHECDataInBatches(ctx context.Context, batchMap hecBatchMap) error {
+	buf := c.bufferPool.get()
+	defer c.bufferPool.put(buf)
+	is := iterState{}
+	var permanentErrors []error
+
+	for scopeKey, events := range batchMap {
+		headers := c.getLocalHeader(scopeKey)
+		for !is.done {
+			buf.Reset()
+			latestIterState, batchPermanentErrors := c.fillEventsBuffer(events, buf, is)
+			permanentErrors = append(permanentErrors, batchPermanentErrors...)
+			if !buf.Empty() {
+				if err := c.postEvents(ctx, buf, headers); err != nil {
+					return err
+				}
+			}
+			is = latestIterState
+		}
+	}
+
+	return multierr.Combine(permanentErrors...)
+}
+
+func (c *client) getLocalHeader(scopeKey hecScope) map[string]string {
+	localHeaders := map[string]string{}
+	if scopeKey.hecToken != "" {
+		localHeaders["Authorization"] = splunk.HECTokenHeader + " " + scopeKey.hecToken
+	}
+	if scopeKey.isProfilingData {
+		localHeaders[libraryHeaderName] = profilingLibraryName
+	}
+	return localHeaders
+}
+
+func (c *client) fillEventsBuffer(events []*splunk.Event, buf buffer, is iterState) (iterState, []error) {
+	var b []byte
+	var permanentErrors []error
+	jsonStream := jsonStreamPool.Get().(*jsoniter.Stream)
+	defer jsonStreamPool.Put(jsonStream)
+
+	for i := is.event; i < len(events); i++ {
+		event := events[i]
+		if c.config.ExportRaw {
+			b = []byte(event.Event.(string) + "\n")
+		} else {
+			// JSON encoding event and writing to buffer.
+			var err error
+			b, err = marshalEvent(event, c.config.MaxEventSize, jsonStream)
+			if err != nil {
+				permanentErrors = append(permanentErrors, consumererror.NewPermanent(fmt.Errorf(
+					"dropped log event: %v, error: %w", event, err)))
+				continue
+			}
+		}
+
+		// Continue adding events to buffer up to capacity.
+		_, err := buf.Write(b)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, errOverCapacity) {
+			if !buf.Empty() {
+				return iterState{event: i, done: false}, permanentErrors
+			}
+			permanentErrors = append(permanentErrors, consumererror.NewPermanent(
+				fmt.Errorf("dropped hec event: error: event size %d bytes larger than configured max"+
+					" content length %d bytes", len(b), c.config.MaxContentLengthLogs)))
+			return iterState{event: i + 1, done: false}, permanentErrors
+		}
+		permanentErrors = append(permanentErrors,
+			consumererror.NewPermanent(fmt.Errorf("error writing the event: %w", err)))
+	}
+
+	return iterState{done: true}, permanentErrors
 }
 
 func (c *client) pushMetricsData(
@@ -227,12 +305,12 @@ func (c *client) fillLogsBuffer(logs plog.Logs, buf buffer, is iterState) (iterS
 				}
 				if errors.Is(err, errOverCapacity) {
 					if !buf.Empty() {
-						return iterState{i, j, k, false}, permanentErrors
+						return iterState{resource: i, library: j, record: k, done: false}, permanentErrors
 					}
 					permanentErrors = append(permanentErrors, consumererror.NewPermanent(
 						fmt.Errorf("dropped log event: error: event size %d bytes larger than configured max"+
 							" content length %d bytes", len(b), c.config.MaxContentLengthLogs)))
-					return iterState{i, j, k + 1, false}, permanentErrors
+					return iterState{resource: i, library: j, record: k + 1, done: false}, permanentErrors
 				}
 				permanentErrors = append(permanentErrors,
 					consumererror.NewPermanent(fmt.Errorf("error writing the event: %w", err)))
@@ -279,12 +357,12 @@ func (c *client) fillMetricsBuffer(metrics pmetric.Metrics, buf buffer, is iterS
 				}
 				if errors.Is(err, errOverCapacity) {
 					if !buf.Empty() {
-						return iterState{i, j, k, false}, permanentErrors
+						return iterState{resource: i, library: j, record: k, done: false}, permanentErrors
 					}
 					permanentErrors = append(permanentErrors, consumererror.NewPermanent(
 						fmt.Errorf("dropped metric event: error: event size %d bytes larger than configured max"+
 							" content length %d bytes", len(b), c.config.MaxContentLengthMetrics)))
-					return iterState{i, j, k + 1, false}, permanentErrors
+					return iterState{resource: i, library: j, record: k + 1, done: false}, permanentErrors
 				}
 				permanentErrors = append(permanentErrors, consumererror.NewPermanent(fmt.Errorf(
 					"error writing the event: %w", err)))
@@ -363,12 +441,12 @@ func (c *client) fillTracesBuffer(traces ptrace.Traces, buf buffer, is iterState
 				}
 				if errors.Is(err, errOverCapacity) {
 					if !buf.Empty() {
-						return iterState{i, j, k, false}, permanentErrors
+						return iterState{resource: i, library: j, record: k, done: false}, permanentErrors
 					}
 					permanentErrors = append(permanentErrors, consumererror.NewPermanent(
 						fmt.Errorf("dropped span event: error: event size %d bytes larger than configured max"+
 							" content length %d bytes", len(b), c.config.MaxContentLengthTraces)))
-					return iterState{i, j, k + 1, false}, permanentErrors
+					return iterState{resource: i, library: j, record: k + 1, done: false}, permanentErrors
 				}
 				permanentErrors = append(permanentErrors, consumererror.NewPermanent(fmt.Errorf(
 					"error writing the event: %w", err)))

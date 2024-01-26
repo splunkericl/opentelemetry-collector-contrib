@@ -4,15 +4,16 @@
 package splunkhecexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunkhecexporter"
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
-
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
 )
 
 const (
@@ -22,6 +23,78 @@ const (
 	// traceIDFieldKey is the key used in the log event for the trace id (if any).
 	traceIDFieldKey = "trace_id"
 )
+
+func newHecLogConverter(config *Config, exportFunc hecRequestExportFunc) *hecLogConverter {
+	return &hecLogConverter{
+		hecDataConverter: hecDataConverter{
+			config:     config,
+			exportFunc: exportFunc,
+		},
+		legacyUnmarshaller: &plog.ProtoUnmarshaler{},
+	}
+}
+
+// hecLogConverter extends hecDataConverter for log data
+type hecLogConverter struct {
+	hecDataConverter
+	legacyUnmarshaller *plog.ProtoUnmarshaler
+}
+
+// Unmarshal un-marshals given bytes back to hecRequest
+// This method is needed for reading data from persistent queue
+func (hlc *hecLogConverter) Unmarshal(data []byte) (exporterhelper.Request, error) {
+	req, err := hlc.hecDataConverter.Unmarshal(data)
+	// Backward compatibility issue. Before exporter batching, persistent queue defaults to use protobuf marshaller/unmarshaller
+	// For a period of time, we want to attempt to unmarshal previous requests until all clients have migrated to the
+	// latest version
+	if err != nil {
+		if logs, err := hlc.legacyUnmarshaller.UnmarshalLogs(data); err == nil {
+			return newHecRequest(hlc.exportFunc, hlc.logsToSplunkEvents(logs)), nil
+		} else {
+			return nil, err
+		}
+	}
+	return req, err
+}
+
+func (hlc *hecLogConverter) RequestFromLogs(_ context.Context, logs plog.Logs) (exporterhelper.Request, error) {
+	data := hlc.logsToSplunkEvents(logs)
+	return newHecRequest(hlc.exportFunc, data), nil
+}
+
+func (hlc *hecLogConverter) logsToSplunkEvents(logs plog.Logs) hecBatchMap {
+	result := hecBatchMap{}
+
+	logsIn := logs.ResourceLogs()
+	for i := 0; i < logsIn.Len(); i++ {
+		resourceLogs := logsIn.At(i)
+		resources := resourceLogs.Resource()
+		sls := resourceLogs.ScopeLogs()
+
+		scopeKey := hecScope{}
+		if accessToken, ok := resources.Attributes().Get(splunk.HecTokenLabel); ok {
+			scopeKey.hecToken = accessToken.Str()
+		}
+		if index, ok := resources.Attributes().Get(splunk.DefaultIndexLabel); ok {
+			scopeKey.index = index.Str()
+		}
+		if sls.Len() > 0 && isProfilingData(sls.At(0)) {
+			scopeKey.isProfilingData = true
+		}
+
+		var events []*splunk.Event
+		for j := 0; j < sls.Len(); j++ {
+			logSlice := sls.At(j).LogRecords()
+			numLogs := logSlice.Len()
+			for k := 0; k < numLogs; k++ {
+				record := logSlice.At(k)
+				events = append(events, mapLogRecordToSplunkEvent(resources, record, hlc.config))
+			}
+		}
+		result[scopeKey] = events
+	}
+	return result
+}
 
 func mapLogRecordToSplunkEvent(res pcommon.Resource, lr plog.LogRecord, config *Config) *splunk.Event {
 	host := unknownHostName

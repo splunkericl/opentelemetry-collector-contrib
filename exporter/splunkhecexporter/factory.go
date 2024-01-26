@@ -15,9 +15,10 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	conventions "go.opentelemetry.io/collector/semconv/v1.6.1"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunkhecexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/batchperresourceattr"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunkhecexporter/internal/metadata"
 )
 
 const (
@@ -27,6 +28,8 @@ const (
 	defaultHTTP2PingTimeout     = time.Second * 10
 	defaultIdleConnTimeout      = 10 * time.Second
 	defaultSplunkAppName        = "OpenTelemetry Collector Contrib"
+	defaultBatchTimeout         = 10 * time.Millisecond
+	defaultS2SBatchSize         = 128
 )
 
 // TODO: Find a place for this to be shared.
@@ -43,12 +46,22 @@ type baseLogsExporter struct {
 
 // NewFactory creates a factory for Splunk HEC exporter.
 func NewFactory() exporter.Factory {
+	return NewFactoryWithExporterBatching(false)
+}
+
+// NewFactoryWithExporterBatching creates a factory for Splunk HEC exporter with useExporterBatching option.
+func NewFactoryWithExporterBatching(useExporterBatching bool) exporter.Factory {
+	createLogFn := createLogsExporter
+	if useExporterBatching {
+		createLogFn = createLogsExporterWithExporterBatching
+	}
+
 	return exporter.NewFactory(
 		metadata.Type,
 		createDefaultConfig,
 		exporter.WithTraces(createTracesExporter, metadata.TracesStability),
 		exporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
-		exporter.WithLogs(createLogsExporter, metadata.LogsStability))
+		exporter.WithLogs(createLogFn, metadata.LogsStability))
 }
 
 func createDefaultConfig() component.Config {
@@ -184,4 +197,41 @@ func createLogsExporter(
 	}
 
 	return wrapped, nil
+}
+
+func createLogsExporterWithExporterBatching(
+	ctx context.Context,
+	set exporter.CreateSettings,
+	config component.Config,
+) (exporter exporter.Logs, err error) {
+	cfg := config.(*Config)
+
+	c := newLogsClient(set, cfg)
+
+	logsConverter := newHecLogConverter(cfg, c.pushHECDataInBatches)
+
+	return exporterhelper.NewLogsRequestExporter(
+		ctx,
+		set,
+		logsConverter.RequestFromLogs,
+		// explicitly disable since we rely on http.Client timeout logic.
+		exporterhelper.WithTimeout(exporterhelper.TimeoutSettings{Timeout: 0}),
+		exporterhelper.WithBatcher(
+			exporterhelper.MergeBatcherConfig{
+				Enabled: true,
+				Timeout: defaultBatchTimeout,
+			},
+			hecMergeFunc,
+			exporterhelper.WithSplitBatcher(exporterhelper.SplitBatcherConfig{
+				MaxSizeItems: defaultS2SBatchSize,
+			}, hecMergeSplitFunc)),
+		exporterhelper.WithRequestQueue(exporterhelper.QueueConfig{
+			Enabled:        cfg.QueueSettings.Enabled,
+			NumConsumers:   cfg.QueueSettings.NumConsumers,
+			QueueItemsSize: defaultS2SBatchSize * cfg.QueueSettings.QueueSize,
+		}, exporterhelper.NewPersistentQueueFactory(cfg.QueueSettings.StorageID, logsConverter.Marshal, logsConverter.Unmarshal)),
+		exporterhelper.WithRetry(cfg.BackOffConfig),
+		exporterhelper.WithStart(c.start),
+		exporterhelper.WithShutdown(c.stop),
+	)
 }
